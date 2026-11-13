@@ -415,7 +415,8 @@ export class Runtime implements RuntimeModule {
       // Configured credentials do not prove DNS/connect or UDP delivery works.
       // Use the already-open WS while probes establish the new UDP route.
       this.updateStatus({ audioTransport: this.connection.isOpen ? "ws" : "none" });
-      this.startUdpLiveness();
+      this.stopUdpLiveness();
+      this.syncUdpLiveness();
       return;
     }
     this.audio.close();
@@ -450,7 +451,11 @@ export class Runtime implements RuntimeModule {
     if (!ack) {
       throw new Error("Cannot set subscriptions before the session is connected");
     }
-    await this.subscriptions.set(subs, ack.sessionId);
+    // `set` records the new set synchronously before it writes it to the cloud,
+    // so UDP probing can follow the set without waiting for the write.
+    const write = this.subscriptions.set(subs, ack.sessionId);
+    this.syncUdpLiveness();
+    await write;
   }
 
   /** Encrypt and send one audio frame over the UDP path (see RuntimeModule). */
@@ -553,6 +558,29 @@ export class Runtime implements RuntimeModule {
     }
     this.status = snapshot;
     this.emitter.emit("status", { ...snapshot });
+  }
+
+  /**
+   * Probe the UDP route only while some subscription needs cloud audio.
+   *
+   * With no audio subscriptions the host sends no audio frames, so a probe every
+   * second only keeps the phone awake (issue #4718). When subscriptions empty,
+   * probing stops and the transport falls back to the open WebSocket; when audio
+   * is needed again, a fresh probe must be acknowledged before UDP is used, the
+   * same rule as after a connect.
+   */
+  private syncUdpLiveness(): void {
+    if (this.audio.sessionTag === null) return;
+    const wanted = this.subscriptions.currentSet().length > 0;
+    const probing = this.udpProbeTimer !== null;
+    if (wanted && !probing) {
+      this.startUdpLiveness();
+    } else if (!wanted && probing) {
+      this.stopUdpLiveness();
+      if (this.status.status === "connected") {
+        this.updateStatus({ audioTransport: this.connection.isOpen ? "ws" : "none" });
+      }
+    }
   }
 
   private startUdpLiveness(): void {

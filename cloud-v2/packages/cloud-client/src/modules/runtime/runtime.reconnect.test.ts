@@ -150,6 +150,8 @@ function acknowledgeUdpProbe(socket: FakeSocket, probeId: string): void {
   }));
 }
 
+const TRANSCRIPTION: AudioSubscription[] = [{ kind: "transcription", language: { mode: "auto" } }];
+
 const FAST_RECONNECT = { baseMs: 3, maxMs: 10, jitter: false };
 
 function wait(ms: number): Promise<void> {
@@ -211,6 +213,8 @@ describe("Runtime transcript delivery survives a multi-attempt reconnect", () =>
 
     const emitter = new RuntimeEmitter();
     const subscriptions = new Subscriptions({ http: fakeHttp() });
+    // UDP is probed only while audio is subscribed (see the idle-probe tests below).
+    await subscriptions.set(TRANSCRIPTION, "pre-connect");
     const connection = new Connection({
       ws,
       url: "wss://example.test/ws",
@@ -297,6 +301,8 @@ describe("Runtime transcript delivery survives a multi-attempt reconnect", () =>
 
     const emitter = new RuntimeEmitter();
     const subscriptions = new Subscriptions({ http: fakeHttp() });
+    // UDP is probed only while audio is subscribed (see the idle-probe tests below).
+    await subscriptions.set(TRANSCRIPTION, "pre-connect");
     const connection = new Connection({
       ws,
       url: "wss://example.test/ws",
@@ -586,6 +592,128 @@ describe("Runtime transcript delivery survives a multi-attempt reconnect", () =>
     recoverySocket.pushTranscript("after reconnect");
     expect(received).toEqual(["before drop", "after reconnect"]);
 
+    runtime.close();
+  });
+});
+
+describe("Runtime UDP liveness follows audio subscriptions", () => {
+  function setup() {
+    const socket = new FakeSocket();
+    let created = 0;
+    const udpSent: Uint8Array[] = [];
+    const intervals = { started: 0, cleared: 0 };
+    const timers: CloudClientTimers = {
+      ...systemTimers,
+      setInterval(callback, intervalMs) {
+        intervals.started += 1;
+        return systemTimers.setInterval(callback, intervalMs);
+      },
+      clearInterval(handle) {
+        intervals.cleared += 1;
+        systemTimers.clearInterval(handle);
+      },
+    };
+    const subscriptions = new Subscriptions({ http: fakeHttp() });
+    const connection = new Connection({
+      ws: () => {
+        created += 1;
+        return socket;
+      },
+      url: "wss://example.test/ws",
+      getToken: async () => "tok",
+      initPayload: () => ({
+        protocolVersion: "2.0.0",
+        audio: {
+          codec: "lc3",
+          sampleRate: 16000,
+          initialSubscriptions: subscriptions.currentSet(),
+        },
+      }),
+      reconnect: FAST_RECONNECT,
+      logger: noopLogger,
+    });
+    const runtime = new Runtime({
+      connection,
+      emitter: new RuntimeEmitter(),
+      subscriptions,
+      camera: new Camera({ http: fakeHttp() }),
+      maps: new Maps({ http: fakeHttp() }),
+      tts: fakeTts(),
+      audio: new UdpAudio({ udp: () => recordingUdp(udpSent) }),
+      timers,
+      logger: noopLogger,
+      forceRefreshToken: async () => "tok",
+    });
+    const connect = async () => {
+      const connected = runtime.connect();
+      await waitUntil(() => created >= 1);
+      socket.handshake(ACK_WITH_AUDIO);
+      await connected;
+    };
+    return { socket, runtime, udpSent, intervals, connect, created: () => created };
+  }
+
+  test("does not probe UDP while no audio is subscribed", async () => {
+    const { runtime, udpSent, intervals, connect } = setup();
+    await connect();
+    expect(runtime.getStatus()).toEqual({ status: "connected", audioTransport: "ws" });
+    expect(udpSent).toHaveLength(0);
+    expect(intervals.started).toBe(0);
+    await wait(1_100);
+    expect(udpSent).toHaveLength(0);
+    runtime.close();
+  });
+
+  test("starts probing when audio is subscribed and uses UDP only after a fresh ack", async () => {
+    const { socket, runtime, udpSent, intervals, connect } = setup();
+    await connect();
+    await runtime.setSubscriptions(TRANSCRIPTION);
+    expect(intervals.started).toBe(1);
+    expect(udpSent).toHaveLength(1);
+    expect(runtime.getStatus().audioTransport).toBe("ws");
+    acknowledgeUdpProbe(socket, readProbeId(udpSent.at(-1)!));
+    expect(runtime.getStatus()).toEqual({ status: "connected", audioTransport: "udp" });
+    // Re-sending a non-empty set keeps the running probe loop.
+    await runtime.setSubscriptions(TRANSCRIPTION);
+    expect(intervals.started).toBe(1);
+    expect(runtime.getStatus().audioTransport).toBe("udp");
+    runtime.close();
+  });
+
+  test("stops probing when subscriptions become empty and re-proves UDP when audio returns", async () => {
+    const { socket, runtime, udpSent, intervals, connect } = setup();
+    await connect();
+    await runtime.setSubscriptions(TRANSCRIPTION);
+    const firstProbeId = readProbeId(udpSent.at(-1)!);
+    acknowledgeUdpProbe(socket, firstProbeId);
+    expect(runtime.getStatus().audioTransport).toBe("udp");
+
+    await runtime.setSubscriptions([]);
+    expect(intervals.cleared).toBeGreaterThanOrEqual(1);
+    expect(runtime.getStatus()).toEqual({ status: "connected", audioTransport: "ws" });
+    const sentWhileIdle = udpSent.length;
+    await wait(1_100);
+    expect(udpSent).toHaveLength(sentWhileIdle);
+
+    await runtime.setSubscriptions(TRANSCRIPTION);
+    expect(intervals.started).toBe(2);
+    // An ack for a probe from before the idle period does not restore UDP.
+    acknowledgeUdpProbe(socket, firstProbeId);
+    expect(runtime.getStatus().audioTransport).toBe("ws");
+    acknowledgeUdpProbe(socket, readProbeId(udpSent.at(-1)!));
+    expect(runtime.getStatus().audioTransport).toBe("udp");
+    runtime.close();
+  });
+
+  test("a reconnect with no audio subscribed does not resume probing", async () => {
+    const { socket, runtime, udpSent, connect, created } = setup();
+    await connect();
+    socket.closeCb?.({ code: 1006, reason: "network lost" });
+    await waitUntil(() => created() === 2);
+    socket.handshake(ACK_WITH_AUDIO);
+    await waitUntil(() => runtime.getStatus().status === "connected");
+    expect(runtime.getStatus().audioTransport).toBe("ws");
+    expect(udpSent).toHaveLength(0);
     runtime.close();
   });
 });
